@@ -1,0 +1,4 @@
+fastapi
+uvicorn[standard]
+asyncpg
+redis>=5.0.0
