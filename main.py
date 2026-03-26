@@ -1,80 +1,63 @@
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
-import asyncpg
-import redis.asyncio as redis
 import os
+import time
+import logging
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+import psycopg2
+from psycopg2 import OperationalError
 
-app = FastAPI()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Отримуємо змінні оточення
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres")
-REDIS_ADDR = os.getenv("REDIS_ADDR", "redis://localhost:6379")
-
-db_pool = None
-rdb = None
-
-@app.on_event("startup")
-async def startup():
-    global db_pool, rdb
-    # Postgres pool
-    db_pool = await asyncpg.create_pool(DATABASE_URL)
-    # Redis client
-    rdb = redis.from_url(REDIS_ADDR)
-
-@app.get("/healthz")
-async def healthz():
-    return {"status": "ok"}
-
-@app.get("/readyz")
-async def readyz():
-    try:
-        async with db_pool.acquire() as conn:
-            await conn.fetchval("SELECT 1")
-        await rdb.ping()
-        return {"status": "ready"}
-    except Exception as e:
-        return {"status": "not ready", "error": str(e)}
-
-@app.get("/status")
-async def status():
-    result = {"postgres": "ok", "redis": "ok"}
-    try:
-        async with db_pool.acquire() as conn:
-            await conn.fetchval("SELECT 1")
-    except Exception as e:
-        result["postgres"] = f"error: {e}"
-
-    try:
-        await rdb.ping()
-    except Exception as e:
-        result["redis"] = f"error: {e}"
-
-    return result
-
-@app.get("/", response_class=HTMLResponse)
-async def index(request: Request):
-    html = """
-    <html>
-    <head>
-      <title>Status Page</title>
-      <style>
-        body { font-family: sans-serif; margin: 2rem; }
-        pre { background: #eee; padding: 1rem; }
-      </style>
-    </head>
-    <body>
-      <h1>Service Status</h1>
-      <button onclick="check()">Check Backend</button>
-      <pre id="output"></pre>
-
-      <script>
-        async function check() {
-          const res = await fetch('/status');
-          const data = await res.json();
-          document.getElementById('output').innerText = JSON.stringify(data, null, 2);
-        }
-      </script>
-    </body>
-    </html>
+def wait_for_postgres(max_retries=5, delay=5):
     """
-    return HTMLResponse(content=html)
+    Attempts to connect to PostgreSQL with backoff to handle container race conditions.
+    """
+    db_user = os.getenv("POSTGRES_USER", "postgres")
+    db_password = os.getenv("POSTGRES_PASSWORD", "postgres")
+    db_name = os.getenv("POSTGRES_DB", "postgres")
+    db_host = os.getenv("POSTGRES_HOST", "db")
+    
+    retries = 0
+    while retries < max_retries:
+        try:
+            logger.info(f"Attempting DB connection (attempt {retries + 1}/{max_retries})...")
+            # Connect temporarily to test standard readiness 
+            conn = psycopg2.connect(
+                dbname=db_name,
+                user=db_user,
+                password=db_password,
+                host=db_host
+            )
+            conn.close()
+            logger.info("Database connection successful!")
+            return True
+        except OperationalError as e:
+            logger.warning(f"Database connection failed. Retrying in {delay} seconds...")
+            retries += 1
+            time.sleep(delay)
+            
+    return False
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Starting up FastAPI application...")
+    if not wait_for_postgres():
+        logger.error("Could not establish a database connection. Starting anyway, but some routes may fail.")
+        # Alternatively: raise RuntimeError("Database connection required") to hard-crash on failure
+
+    # Add any extra initialization logic here (e.g. creating SQLAlchemy engine)
+    
+    yield
+    
+    logger.info("Shutting down application...")
+
+app = FastAPI(lifespan=lifespan)
+
+@app.get("/")
+def read_root():
+    return {"message": "Hello from your diploma project API!"}
+
+@app.get("/health")
+def healthcheck():
+    return {"status": "healthy"}
