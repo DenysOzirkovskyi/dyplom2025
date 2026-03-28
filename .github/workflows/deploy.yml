@@ -70,98 +70,99 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Resolve deployment settings
-        shell: pwsh
+        shell: bash
         run: |
-          $repoOwner = "${{ github.repository_owner }}".ToLowerInvariant()
-          $repoName = "${{ github.event.repository.name }}".ToLowerInvariant()
-          $registryNamespace = "ghcr.io/$repoOwner"
-          $appImage = "ghcr.io/$repoOwner/$repoName:latest"
-          "REPO_OWNER=$repoOwner" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "REPO_NAME=$repoName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "REGISTRY_NAMESPACE=$registryNamespace" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "APP_IMAGE=$appImage" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          repo_owner="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          repo_name="$(echo '${{ github.event.repository.name }}' | tr '[:upper:]' '[:lower:]')"
+          registry_namespace="ghcr.io/${repo_owner}"
+          app_image="ghcr.io/${repo_owner}/${repo_name}:latest"
+          echo "REPO_OWNER=${repo_owner}" >> "$GITHUB_ENV"
+          echo "REPO_NAME=${repo_name}" >> "$GITHUB_ENV"
+          echo "REGISTRY_NAMESPACE=${registry_namespace}" >> "$GITHUB_ENV"
+          echo "APP_IMAGE=${app_image}" >> "$GITHUB_ENV"
 
       - name: Resolve SSH key
-        shell: pwsh
+        shell: bash
         run: |
-          $secretKey = "${{ secrets.VM_SSH_PRIVATE_KEY }}"
-          if (-not [string]::IsNullOrWhiteSpace($secretKey)) {
-            $keyPath = Join-Path $env:RUNNER_TEMP "vagrant_vm_key"
-            [System.IO.File]::WriteAllText($keyPath, $secretKey.Replace("`r", ""), (New-Object System.Text.UTF8Encoding($false)))
-            "SSH_KEY_PATH=$keyPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-            Write-Host "Using SSH private key from GitHub Secrets."
+          secret_key="${{ secrets.VM_SSH_PRIVATE_KEY }}"
+          if [ -n "$secret_key" ]; then
+            key_path="$RUNNER_TEMP/vagrant_vm_key"
+            printf '%s\n' "$secret_key" | tr -d '\r' > "$key_path"
+            chmod 600 "$key_path"
+            echo "SSH_KEY_PATH=$key_path" >> "$GITHUB_ENV"
+            echo "Using SSH private key from GitHub Secrets."
             exit 0
-          }
+          fi
 
-          $candidatePaths = @(
-            (Join-Path $env:GITHUB_WORKSPACE ".vagrant\machines\default\virtualbox\private_key"),
-            (Join-Path $env:RUNNER_WORKSPACE "${{ github.event.repository.name }}\.vagrant\machines\default\virtualbox\private_key"),
-            (Join-Path $HOME ".vagrant.d\insecure_private_key"),
-            (Join-Path $env:USERPROFILE ".vagrant.d\insecure_private_key")
-          ) | Where-Object { $_ -and $_.Trim() -ne "" }
+          candidate_paths=(
+            "$GITHUB_WORKSPACE/.vagrant/machines/default/virtualbox/private_key"
+            "$RUNNER_WORKSPACE/${{ github.event.repository.name }}/${{ github.event.repository.name }}/.vagrant/machines/default/virtualbox/private_key"
+            "$HOME/.vagrant.d/insecure_private_key"
+          )
 
-          $existingPath = $candidatePaths | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $existingPath) {
-            Write-Error "No SSH private key found. Set VM_SSH_PRIVATE_KEY secret or ensure the local Vagrant key exists on the self-hosted runner."
-            exit 1
-          }
+          for path in "${candidate_paths[@]}"; do
+            if [ -f "$path" ]; then
+              chmod 600 "$path" || true
+              echo "SSH_KEY_PATH=$path" >> "$GITHUB_ENV"
+              echo "Using local SSH private key: $path"
+              exit 0
+            fi
+          done
 
-          "SSH_KEY_PATH=$existingPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          Write-Host "Using local SSH private key: $existingPath"
+          echo "No SSH private key found. Set VM_SSH_PRIVATE_KEY secret or ensure the local Vagrant key exists on the self-hosted runner." >&2
+          exit 1
 
       - name: Debug resolved variables
-        shell: pwsh
+        shell: bash
         run: |
-          Write-Host "Working directory: $env:GITHUB_WORKSPACE"
-          Write-Host "SSH target: $env:VM_USER@$env:VM_HOST:$env:VM_PORT"
-          Write-Host "POSTGRES_USER=$env:POSTGRES_USER"
-          Write-Host "POSTGRES_DB=$env:POSTGRES_DB"
-          Write-Host "REGISTRY_NAMESPACE=$env:REGISTRY_NAMESPACE"
-          Write-Host "REPO_NAME=$env:REPO_NAME"
-          Write-Host "APP_IMAGE=$env:APP_IMAGE"
-          Write-Host "SSH_KEY_PATH=$env:SSH_KEY_PATH"
+          echo "Working directory: $GITHUB_WORKSPACE"
+          echo "SSH target: $VM_USER@$VM_HOST:$VM_PORT"
+          echo "POSTGRES_USER=$POSTGRES_USER"
+          echo "POSTGRES_DB=$POSTGRES_DB"
+          echo "REGISTRY_NAMESPACE=$REGISTRY_NAMESPACE"
+          echo "REPO_NAME=$REPO_NAME"
+          echo "APP_IMAGE=$APP_IMAGE"
+          echo "SSH_KEY_PATH=$SSH_KEY_PATH"
 
       - name: Create deployment env file
-        shell: pwsh
+        shell: bash
         run: |
-          $envPath = Join-Path $env:RUNNER_TEMP "deploy.env"
-          $content = @(
-            "POSTGRES_USER=$env:POSTGRES_USER",
-            "POSTGRES_PASSWORD=$env:POSTGRES_PASSWORD",
-            "POSTGRES_DB=$env:POSTGRES_DB",
-            "REGISTRY=$env:REGISTRY_NAMESPACE",
-            "IMAGE_NAME=$env:REPO_NAME",
-            "IMAGE_TAG=latest",
-            "APP_IMAGE=$env:APP_IMAGE",
-            "APP_PORT=80"
-          ) -join "`n"
-          [System.IO.File]::WriteAllText($envPath, $content.Replace("`r", ""), (New-Object System.Text.UTF8Encoding($false)))
-          "DEPLOY_ENV_PATH=$envPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          Write-Host "Generated deployment env file at $envPath"
+          env_path="$RUNNER_TEMP/deploy.env"
+          cat > "$env_path" <<EOF
+          POSTGRES_USER=$POSTGRES_USER
+          POSTGRES_PASSWORD=$POSTGRES_PASSWORD
+          POSTGRES_DB=$POSTGRES_DB
+          REGISTRY=$REGISTRY_NAMESPACE
+          IMAGE_NAME=$REPO_NAME
+          IMAGE_TAG=latest
+          APP_IMAGE=$APP_IMAGE
+          APP_PORT=80
+          EOF
+          echo "DEPLOY_ENV_PATH=$env_path" >> "$GITHUB_ENV"
+          echo "Generated deployment env file at $env_path"
 
       - name: Copy deployment files to VM
-        shell: pwsh
+        shell: bash
         run: |
-          $target = "$env:VM_USER@$env:VM_HOST"
-          Write-Host "Copying deployment files to $target"
-          & ssh -i $env:SSH_KEY_PATH -p $env:VM_PORT -o StrictHostKeyChecking=no $target "mkdir -p ~/app"
-          & scp -i $env:SSH_KEY_PATH -P $env:VM_PORT -o StrictHostKeyChecking=no docker-compose.yml "$($target):~/app/docker-compose.yml"
-          & scp -i $env:SSH_KEY_PATH -P $env:VM_PORT -o StrictHostKeyChecking=no $env:DEPLOY_ENV_PATH "$($target):~/app/.env"
-          & scp -i $env:SSH_KEY_PATH -P $env:VM_PORT -o StrictHostKeyChecking=no -r prometheus "$($target):~/app/"
-          & scp -i $env:SSH_KEY_PATH -P $env:VM_PORT -o StrictHostKeyChecking=no -r grafana "$($target):~/app/"
-          & scp -i $env:SSH_KEY_PATH -P $env:VM_PORT -o StrictHostKeyChecking=no -r scripts "$($target):~/app/"
+          target="$VM_USER@$VM_HOST"
+          echo "Copying deployment files to $target"
+          ssh -i "$SSH_KEY_PATH" -p "$VM_PORT" -o StrictHostKeyChecking=no "$target" "mkdir -p ~/app"
+          scp -i "$SSH_KEY_PATH" -P "$VM_PORT" -o StrictHostKeyChecking=no docker-compose.yml "$target:~/app/docker-compose.yml"
+          scp -i "$SSH_KEY_PATH" -P "$VM_PORT" -o StrictHostKeyChecking=no "$DEPLOY_ENV_PATH" "$target:~/app/.env"
+          scp -i "$SSH_KEY_PATH" -P "$VM_PORT" -o StrictHostKeyChecking=no -r prometheus "$target:~/app/"
+          scp -i "$SSH_KEY_PATH" -P "$VM_PORT" -o StrictHostKeyChecking=no -r grafana "$target:~/app/"
+          scp -i "$SSH_KEY_PATH" -P "$VM_PORT" -o StrictHostKeyChecking=no -r scripts "$target:~/app/"
 
       - name: Deploy on VM
-        shell: pwsh
+        shell: bash
         run: |
-          $target = "$env:VM_USER@$env:VM_HOST"
-          $remoteCommand = @(
-            "export GHCR_USERNAME='${{ github.repository_owner }}'",
-            "export GHCR_TOKEN='$env:GHCR_TOKEN'",
-            "cd ~/app",
-            "sed -i 's/\r$//' scripts/deploy.sh",
-            "chmod +x scripts/deploy.sh",
-            "./scripts/deploy.sh"
-          ) -join "`n"
-          Write-Host "Deploying on $target"
-          & ssh -i $env:SSH_KEY_PATH -p $env:VM_PORT -o StrictHostKeyChecking=no $target $remoteCommand
+          target="$VM_USER@$VM_HOST"
+          echo "Deploying on $target"
+          ssh -i "$SSH_KEY_PATH" -p "$VM_PORT" -o StrictHostKeyChecking=no "$target" "
+            export GHCR_USERNAME='${{ github.repository_owner }}'
+            export GHCR_TOKEN='$GHCR_TOKEN'
+            cd ~/app
+            sed -i 's/\r$//' scripts/deploy.sh
+            chmod +x scripts/deploy.sh
+            ./scripts/deploy.sh
+          "
