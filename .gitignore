@@ -1,0 +1,22 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
+
+# Vagrant
+.vagrant/
+
+# Runner
+actions-runner/
+
+# OS
+*.exe
+*.zip
+
+# Python
+venv/
+__pycache__/
+
+# Docker
+.env

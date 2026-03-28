@@ -1,16 +1,17 @@
-name: Build and Deploy
+name: Build and Deploy to Local VM
 
 on:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  IMAGE_REPOSITORY: ${{ github.repository }}
 
 jobs:
-  build-and-push:
+  build:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -20,64 +21,140 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Log in to the Container registry
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ github.token }}
 
-      - name: Extract metadata for Docker
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=sha
-            type=raw,value=latest
+      - name: Set image tags
+        id: image
+        run: |
+          echo "image=${REGISTRY}/${IMAGE_REPOSITORY}:sha-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "latest=${REGISTRY}/${IMAGE_REPOSITORY}:latest" >> "$GITHUB_OUTPUT"
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: |
+            ${{ steps.image.outputs.image }}
+            ${{ steps.image.outputs.latest }}
 
   deploy:
-    runs-on: ubuntu-latest
-    needs: build-and-push
-    
+    runs-on: self-hosted
+    needs: build
+    permissions:
+      contents: read
+      packages: read
+    env:
+      VM_HOST: ${{ secrets.VM_HOST || '192.168.56.10' }}
+      VM_PORT: ${{ secrets.VM_PORT || '22' }}
+      VM_USER: ${{ secrets.VM_USER || 'vagrant' }}
+      POSTGRES_USER: ${{ secrets.POSTGRES_USER || 'postgres' }}
+      POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD || 'postgres' }}
+      POSTGRES_DB: ${{ secrets.POSTGRES_DB || 'appdb' }}
+      GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || github.token }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Copy docker-compose and deploy script to VM
-        uses: appleboy/scp-action@master
-        with:
-          host: ${{ secrets.VM_HOST }}
-          username: ${{ secrets.VM_USER }}
-          key: ${{ secrets.VM_SSH_KEY }}
-          source: "docker-compose.yml,scripts/deploy.sh"
-          target: "~/app"
+      - name: Resolve deployment settings
+        shell: pwsh
+        run: |
+          $repoOwner = "${{ github.repository_owner }}"
+          $repoName = "${{ github.event.repository.name }}"
+          $registryNamespace = "ghcr.io/$repoOwner"
+          $appImage = "ghcr.io/$repoOwner/$repoName:latest"
+          "REPO_OWNER=$repoOwner" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "REPO_NAME=$repoName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "REGISTRY_NAMESPACE=$registryNamespace" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "APP_IMAGE=$appImage" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Execute deployment script on VM
-        uses: appleboy/ssh-action@master
-        with:
-          host: ${{ secrets.VM_HOST }}
-          username: ${{ secrets.VM_USER }}
-          key: ${{ secrets.VM_SSH_KEY }}
-          script: |
-            chmod +x ~/app/scripts/deploy.sh
-            
-            export IMAGE_TAG=latest
-            export REGISTRY=${{ env.REGISTRY }}
-            export IMAGE_NAME=${{ env.IMAGE_NAME }}
-            export POSTGRES_USER=${{ secrets.POSTGRES_USER }}
-            export POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
-            export POSTGRES_DB=${{ secrets.POSTGRES_DB }}
-            export GH_PAT=${{ secrets.GITHUB_TOKEN }}
-            export GH_ACTOR=${{ github.actor }}
-            
-            cd ~/app
-            ./scripts/deploy.sh
+      - name: Resolve SSH key
+        shell: pwsh
+        run: |
+          $secretKey = "${{ secrets.VM_SSH_PRIVATE_KEY }}"
+          if (-not [string]::IsNullOrWhiteSpace($secretKey)) {
+            $keyPath = Join-Path $env:RUNNER_TEMP "vagrant_vm_key"
+            [System.IO.File]::WriteAllText($keyPath, $secretKey.Replace("`r", ""), (New-Object System.Text.UTF8Encoding($false)))
+            "SSH_KEY_PATH=$keyPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            Write-Host "Using SSH private key from GitHub Secrets."
+            exit 0
+          }
+
+          $candidatePaths = @(
+            (Join-Path $env:GITHUB_WORKSPACE ".vagrant\machines\default\virtualbox\private_key"),
+            (Join-Path $env:RUNNER_WORKSPACE "${{ github.event.repository.name }}\.vagrant\machines\default\virtualbox\private_key"),
+            (Join-Path $HOME ".vagrant.d\insecure_private_key"),
+            (Join-Path $env:USERPROFILE ".vagrant.d\insecure_private_key")
+          ) | Where-Object { $_ -and $_.Trim() -ne "" }
+
+          $existingPath = $candidatePaths | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $existingPath) {
+            Write-Error "No SSH private key found. Set VM_SSH_PRIVATE_KEY secret or ensure the local Vagrant key exists on the self-hosted runner."
+            exit 1
+          }
+
+          "SSH_KEY_PATH=$existingPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Using local SSH private key: $existingPath"
+
+      - name: Debug resolved variables
+        shell: pwsh
+        run: |
+          Write-Host "Working directory: $env:GITHUB_WORKSPACE"
+          Write-Host "SSH target: $env:VM_USER@$env:VM_HOST:$env:VM_PORT"
+          Write-Host "POSTGRES_USER=$env:POSTGRES_USER"
+          Write-Host "POSTGRES_DB=$env:POSTGRES_DB"
+          Write-Host "REGISTRY_NAMESPACE=$env:REGISTRY_NAMESPACE"
+          Write-Host "REPO_NAME=$env:REPO_NAME"
+          Write-Host "APP_IMAGE=$env:APP_IMAGE"
+          Write-Host "SSH_KEY_PATH=$env:SSH_KEY_PATH"
+
+      - name: Create deployment env file
+        shell: pwsh
+        run: |
+          $envPath = Join-Path $env:RUNNER_TEMP "deploy.env"
+          $content = @(
+            "POSTGRES_USER=$env:POSTGRES_USER",
+            "POSTGRES_PASSWORD=$env:POSTGRES_PASSWORD",
+            "POSTGRES_DB=$env:POSTGRES_DB",
+            "REGISTRY=$env:REGISTRY_NAMESPACE",
+            "IMAGE_NAME=$env:REPO_NAME",
+            "IMAGE_TAG=latest",
+            "APP_IMAGE=$env:APP_IMAGE",
+            "APP_PORT=80"
+          ) -join "`n"
+          [System.IO.File]::WriteAllText($envPath, $content.Replace("`r", ""), (New-Object System.Text.UTF8Encoding($false)))
+          "DEPLOY_ENV_PATH=$envPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Generated deployment env file at $envPath"
+
+      - name: Copy deployment files to VM
+        shell: pwsh
+        run: |
+          $target = "$env:VM_USER@$env:VM_HOST"
+          Write-Host "Copying deployment files to $target"
+          & ssh -i $env:SSH_KEY_PATH -p $env:VM_PORT -o StrictHostKeyChecking=no $target "mkdir -p ~/app"
+          & scp -i $env:SSH_KEY_PATH -P $env:VM_PORT -o StrictHostKeyChecking=no docker-compose.yml "$($target):~/app/docker-compose.yml"
+          & scp -i $env:SSH_KEY_PATH -P $env:VM_PORT -o StrictHostKeyChecking=no $env:DEPLOY_ENV_PATH "$($target):~/app/.env"
+          & scp -i $env:SSH_KEY_PATH -P $env:VM_PORT -o StrictHostKeyChecking=no -r prometheus "$($target):~/app/"
+          & scp -i $env:SSH_KEY_PATH -P $env:VM_PORT -o StrictHostKeyChecking=no -r grafana "$($target):~/app/"
+          & scp -i $env:SSH_KEY_PATH -P $env:VM_PORT -o StrictHostKeyChecking=no -r scripts "$($target):~/app/"
+
+      - name: Deploy on VM
+        shell: pwsh
+        run: |
+          $target = "$env:VM_USER@$env:VM_HOST"
+          $remoteCommand = @(
+            "export GHCR_USERNAME='${{ github.repository_owner }}'",
+            "export GHCR_TOKEN='$env:GHCR_TOKEN'",
+            "cd ~/app",
+            "sed -i 's/\r$//' scripts/deploy.sh",
+            "chmod +x scripts/deploy.sh",
+            "./scripts/deploy.sh"
+          ) -join "`n"
+          Write-Host "Deploying on $target"
+          & ssh -i $env:SSH_KEY_PATH -p $env:VM_PORT -o StrictHostKeyChecking=no $target $remoteCommand

@@ -1,38 +1,44 @@
-version: '3.8'
-
 services:
   web:
-    image: ${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG:-latest}
-    container_name: fastapi_app
+    image: ${APP_IMAGE:-ghcr.io/your-user/your-repo:latest}
+    container_name: queue_web
     ports:
-      - "80:8000"
+      - "${APP_PORT:-8000}:8000"
     environment:
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - POSTGRES_DB=${POSTGRES_DB}
-      - POSTGRES_HOST=db
-      - REDIS_URL=redis://redis:6379
+      POSTGRES_USER: ${POSTGRES_USER:-queue_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-queue_password}
+      POSTGRES_DB: ${POSTGRES_DB:-queue_db}
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      REDIS_URL: redis://redis:6379/0
     depends_on:
       db:
         condition: service_healthy
       redis:
         condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
     restart: unless-stopped
     networks:
       - app_network
 
   db:
     image: postgres:15-alpine
-    container_name: postgres_db
+    container_name: queue_db
+    ports:
+      - "5432:5432"
     environment:
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - POSTGRES_DB=${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER:-queue_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-queue_password}
+      POSTGRES_DB: ${POSTGRES_DB:-queue_db}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
-      interval: 5s
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-queue_user} -d ${POSTGRES_DB:-queue_db}"]
+      interval: 10s
       timeout: 5s
       retries: 5
     restart: unless-stopped
@@ -41,16 +47,125 @@ services:
 
   redis:
     image: redis:7-alpine
-    container_name: redis_cache
-    restart: unless-stopped
+    container_name: queue_redis
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redis_data:/data
+    restart: unless-stopped
+    networks:
+      - app_network
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: queue_prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      web:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - app_network
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: queue_grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_PATHS_PROVISIONING: /etc/grafana/provisioning
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      prometheus:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - app_network
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: queue_cadvisor
+    ports:
+      - "8080:8080"
+    privileged: true
+    devices:
+      - /dev/kmsg:/dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      - /dev/disk:/dev/disk:ro
+    restart: unless-stopped
+    networks:
+      - app_network
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: queue_node_exporter
+    ports:
+      - "9100:9100"
+    command:
+      - "--path.procfs=/host/proc"
+      - "--path.rootfs=/rootfs"
+      - "--path.sysfs=/host/sys"
+      - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    restart: unless-stopped
+    networks:
+      - app_network
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    container_name: queue_postgres_exporter
+    ports:
+      - "9187:9187"
+    environment:
+      DATA_SOURCE_NAME: postgresql://${POSTGRES_USER:-queue_user}:${POSTGRES_PASSWORD:-queue_password}@db:5432/${POSTGRES_DB:-queue_db}?sslmode=disable
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - app_network
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.62.0
+    container_name: queue_redis_exporter
+    ports:
+      - "9121:9121"
+    environment:
+      REDIS_ADDR: redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_started
+    restart: unless-stopped
     networks:
       - app_network
 
 volumes:
   postgres_data:
   redis_data:
+  prometheus_data:
+  grafana_data:
 
 networks:
   app_network:

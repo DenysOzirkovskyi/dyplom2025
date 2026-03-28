@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+
+{% block title %}Ticket Dashboard{% endblock %}
+
+{% block content %}
+<section class="panel">
+    <div class="panel-heading">
+        <div>
+            <p class="eyebrow">Overview</p>
+            <h2>Current Tickets</h2>
+        </div>
+        <a href="/create" class="button">New Ticket</a>
+    </div>
+
+    {% if tickets %}
+    <div class="ticket-grid">
+        {% for ticket in tickets %}
+        <article class="ticket-card status-{{ ticket.status }}">
+            <div class="ticket-card-header">
+                <div>
+                    <span class="ticket-id">#{{ ticket.id }}</span>
+                    <h3>{{ ticket.title }}</h3>
+                </div>
+                <span class="status-pill">{{ ticket.status.replace('_', ' ') }}</span>
+            </div>
+            <p class="ticket-description">{{ ticket.description }}</p>
+            <p class="ticket-date">Created: {{ ticket.created_at }}</p>
+
+            <form action="/tickets/{{ ticket.id }}/status" method="post" class="inline-form">
+                <label for="status-{{ ticket.id }}">Status</label>
+                <select id="status-{{ ticket.id }}" name="status">
+                    {% for status in statuses %}
+                    <option value="{{ status }}" {% if status == ticket.status %}selected{% endif %}>
+                        {{ status.replace('_', ' ') }}
+                    </option>
+                    {% endfor %}
+                </select>
+                <button type="submit">Update</button>
+            </form>
+
+            <form action="/tickets/{{ ticket.id }}/delete" method="post" class="inline-form delete-form">
+                <button type="submit" class="danger">Delete</button>
+            </form>
+        </article>
+        {% endfor %}
+    </div>
+    {% else %}
+    <div class="empty-state">
+        <h3>No tickets yet</h3>
+        <p>Create the first request to start managing the queue.</p>
+        <a href="/create" class="button">Create Ticket</a>
+    </div>
+    {% endif %}
+</section>
+{% endblock %}

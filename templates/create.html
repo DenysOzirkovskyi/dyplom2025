@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+
+{% block title %}Create Ticket{% endblock %}
+
+{% block content %}
+<section class="panel form-panel">
+    <div class="panel-heading">
+        <div>
+            <p class="eyebrow">New Request</p>
+            <h2>Create Ticket</h2>
+        </div>
+    </div>
+
+    <form action="/tickets/ui" method="post" class="ticket-form">
+        <label for="title">Title</label>
+        <input id="title" name="title" type="text" placeholder="Short ticket title" required>
+
+        <label for="description">Description</label>
+        <textarea id="description" name="description" rows="6" placeholder="Describe the request" required></textarea>
+
+        <div class="form-actions">
+            <a href="/" class="secondary-button">Cancel</a>
+            <button type="submit">Create Ticket</button>
+        </div>
+    </form>
+</section>
+{% endblock %}
