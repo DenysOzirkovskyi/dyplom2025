@@ -1,6 +1,13 @@
 #!/bin/bash
 set -euo pipefail
 
+if [ -f .env ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . ./.env
+  set +a
+fi
+
 if [ -z "${APP_IMAGE:-}" ]; then
   REGISTRY="${REGISTRY:-ghcr.io/your-user}"
   IMAGE_NAME="${IMAGE_NAME:-your-repo}"
