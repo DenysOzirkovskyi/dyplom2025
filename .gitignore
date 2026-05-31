@@ -2,13 +2,10 @@
 .terraform/
 *.tfstate
 *.tfstate.*
-.terraform.lock.hcl
-
-# Vagrant
-.vagrant/
-
-# Runner
-actions-runner/
+crash.log
+crash.*.log
+tfplan
+*.tfplan
 
 # OS
 *.exe

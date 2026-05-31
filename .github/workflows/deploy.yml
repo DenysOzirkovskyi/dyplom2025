@@ -1,4 +1,4 @@
-name: Build and Deploy to Local VM
+name: Build and Deploy to Azure VM
 
 on:
   push:
@@ -11,11 +11,40 @@ env:
   REGISTRY: ghcr.io
 
 jobs:
-  build:
+  terraform:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+
+    defaults:
+      run:
+        working-directory: terraform/environments/dev
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Check Terraform formatting
+        run: terraform fmt -check -recursive ../..
+
+      - name: Initialize Terraform without backend
+        run: terraform init -backend=false
+
+      - name: Validate Terraform configuration
+        run: terraform validate
+
+  build:
+    runs-on: ubuntu-latest
+    needs: terraform
+    permissions:
+      contents: read
       packages: write
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+      latest: ${{ steps.image.outputs.latest }}
 
     steps:
       - name: Checkout repository
@@ -51,118 +80,68 @@ jobs:
             ${{ steps.image.outputs.latest }}
 
   deploy:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     needs: build
     permissions:
       contents: read
       packages: read
     env:
-      VM_HOST: ${{ secrets.VM_HOST || '192.168.56.10' }}
-      VM_PORT: ${{ secrets.VM_PORT || '22' }}
-      VM_USER: ${{ secrets.VM_USER || 'vagrant' }}
-      POSTGRES_USER: ${{ secrets.POSTGRES_USER || 'postgres' }}
-      POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD || 'postgres' }}
-      POSTGRES_DB: ${{ secrets.POSTGRES_DB || 'appdb' }}
-      GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || github.token }}
+      APP_DIR: /opt/queue-app
+      APP_IMAGE: ${{ needs.build.outputs.image }}
+      APP_PORT: "80"
+      VM_HOST: ${{ secrets.AZURE_VM_HOST }}
+      VM_USER: ${{ secrets.AZURE_VM_USER }}
+      VM_SSH_KEY: ${{ secrets.AZURE_VM_SSH_KEY }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Resolve deployment settings
+      - name: Validate deploy secrets
         shell: bash
         run: |
-          repo_owner="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
-          repo_name="$(echo '${{ github.event.repository.name }}' | tr '[:upper:]' '[:lower:]')"
-          registry_namespace="ghcr.io/${repo_owner}"
-          app_image="ghcr.io/${repo_owner}/${repo_name}:latest"
-          echo "REPO_OWNER=${repo_owner}" >> "$GITHUB_ENV"
-          echo "REPO_NAME=${repo_name}" >> "$GITHUB_ENV"
-          echo "REGISTRY_NAMESPACE=${registry_namespace}" >> "$GITHUB_ENV"
-          echo "APP_IMAGE=${app_image}" >> "$GITHUB_ENV"
+          test -n "$VM_HOST" || { echo "Missing AZURE_VM_HOST secret"; exit 1; }
+          test -n "$VM_USER" || { echo "Missing AZURE_VM_USER secret"; exit 1; }
+          test -n "$VM_SSH_KEY" || { echo "Missing AZURE_VM_SSH_KEY secret"; exit 1; }
 
-      - name: Resolve SSH key
+      - name: Prepare SSH key
         shell: bash
         run: |
-          secret_key="${{ secrets.VM_SSH_PRIVATE_KEY }}"
-          if [ -n "$secret_key" ]; then
-            key_path="$RUNNER_TEMP/vagrant_vm_key"
-            printf '%s\n' "$secret_key" | tr -d '\r' > "$key_path"
-            chmod 600 "$key_path"
-            echo "SSH_KEY_PATH=$key_path" >> "$GITHUB_ENV"
-            echo "Using SSH private key from GitHub Secrets."
-            exit 0
-          fi
+          mkdir -p ~/.ssh
+          printf '%s\n' "$VM_SSH_KEY" > ~/.ssh/azure_vm
+          chmod 600 ~/.ssh/azure_vm
+          ssh-keyscan -H "$VM_HOST" >> ~/.ssh/known_hosts
 
-          candidate_paths=(
-            "$GITHUB_WORKSPACE/.vagrant/machines/default/virtualbox/private_key"
-            "$RUNNER_WORKSPACE/${{ github.event.repository.name }}/${{ github.event.repository.name }}/.vagrant/machines/default/virtualbox/private_key"
-            "$HOME/.vagrant.d/insecure_private_key"
-          )
-
-          for path in "${candidate_paths[@]}"; do
-            if [ -f "$path" ]; then
-              chmod 600 "$path" || true
-              echo "SSH_KEY_PATH=$path" >> "$GITHUB_ENV"
-              echo "Using local SSH private key: $path"
-              exit 0
-            fi
-          done
-
-          echo "No SSH private key found. Set VM_SSH_PRIVATE_KEY secret or ensure the local Vagrant key exists on the self-hosted runner." >&2
-          exit 1
-
-      - name: Debug resolved variables
+      - name: Package runtime files
         shell: bash
         run: |
-          echo "Working directory: $GITHUB_WORKSPACE"
-          echo "SSH target: $VM_USER@$VM_HOST:$VM_PORT"
-          echo "POSTGRES_USER=$POSTGRES_USER"
-          echo "POSTGRES_DB=$POSTGRES_DB"
-          echo "REGISTRY_NAMESPACE=$REGISTRY_NAMESPACE"
-          echo "REPO_NAME=$REPO_NAME"
-          echo "APP_IMAGE=$APP_IMAGE"
-          echo "SSH_KEY_PATH=$SSH_KEY_PATH"
+          tar -czf queue-app-runtime.tgz \
+            docker-compose.yml \
+            prometheus \
+            grafana \
+            scripts
 
-      - name: Create deployment env file
+      - name: Upload runtime files to VM
         shell: bash
         run: |
-          env_path="$RUNNER_TEMP/deploy.env"
-          cat > "$env_path" <<EOF
-          POSTGRES_USER=$POSTGRES_USER
-          POSTGRES_PASSWORD=$POSTGRES_PASSWORD
-          POSTGRES_DB=$POSTGRES_DB
-          REGISTRY=$REGISTRY_NAMESPACE
-          IMAGE_NAME=$REPO_NAME
-          IMAGE_TAG=latest
-          APP_IMAGE=$APP_IMAGE
-          APP_PORT=80
-          EOF
-          echo "DEPLOY_ENV_PATH=$env_path" >> "$GITHUB_ENV"
-          echo "Generated deployment env file at $env_path"
-
-      - name: Copy deployment files to VM
-        shell: bash
-        run: |
-          target="$VM_USER@$VM_HOST"
-          echo "Copying deployment files to $target"
-          ssh -i "$SSH_KEY_PATH" -p "$VM_PORT" -o StrictHostKeyChecking=no "$target" "mkdir -p ~/app"
-          scp -i "$SSH_KEY_PATH" -P "$VM_PORT" -o StrictHostKeyChecking=no docker-compose.yml "$target:~/app/docker-compose.yml"
-          scp -i "$SSH_KEY_PATH" -P "$VM_PORT" -o StrictHostKeyChecking=no "$DEPLOY_ENV_PATH" "$target:~/app/.env"
-          scp -i "$SSH_KEY_PATH" -P "$VM_PORT" -o StrictHostKeyChecking=no -r prometheus "$target:~/app/"
-          scp -i "$SSH_KEY_PATH" -P "$VM_PORT" -o StrictHostKeyChecking=no -r grafana "$target:~/app/"
-          scp -i "$SSH_KEY_PATH" -P "$VM_PORT" -o StrictHostKeyChecking=no -r scripts "$target:~/app/"
+          scp -i ~/.ssh/azure_vm queue-app-runtime.tgz "$VM_USER@$VM_HOST:/tmp/queue-app-runtime.tgz"
+          ssh -i ~/.ssh/azure_vm "$VM_USER@$VM_HOST" "mkdir -p '$APP_DIR' && tar -xzf /tmp/queue-app-runtime.tgz -C '$APP_DIR'"
 
       - name: Deploy on VM
         shell: bash
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ github.token }}
         run: |
-          target="$VM_USER@$VM_HOST"
-          echo "Deploying on $target"
-          ssh -i "$SSH_KEY_PATH" -p "$VM_PORT" -o StrictHostKeyChecking=no "$target" "
-            export GHCR_USERNAME='${{ github.repository_owner }}'
-            export GHCR_TOKEN='$GHCR_TOKEN'
-            cd ~/app
-            sed -i 's/\r$//' scripts/deploy.sh
-            chmod +x scripts/deploy.sh
-            ./scripts/deploy.sh
-          "
+          cat > .env.deploy <<EOF
+          APP_IMAGE=$APP_IMAGE
+          APP_PORT=$APP_PORT
+          POSTGRES_USER=queue_user
+          POSTGRES_PASSWORD=queue_password
+          POSTGRES_DB=queue_db
+          EOF
+
+          scp -i ~/.ssh/azure_vm .env.deploy "$VM_USER@$VM_HOST:/tmp/queue-app.env"
+          ssh -i ~/.ssh/azure_vm "$VM_USER@$VM_HOST" "mv /tmp/queue-app.env '$APP_DIR/.env'"
+          printf '%s' "$GHCR_TOKEN" | ssh -i ~/.ssh/azure_vm "$VM_USER@$VM_HOST" "docker login ghcr.io -u '$GHCR_USERNAME' --password-stdin"
+          ssh -i ~/.ssh/azure_vm "$VM_USER@$VM_HOST" "cd '$APP_DIR' && chmod +x scripts/deploy.sh && ./scripts/deploy.sh"

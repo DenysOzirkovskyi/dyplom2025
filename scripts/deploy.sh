@@ -8,7 +8,11 @@ if [ -z "${APP_IMAGE:-}" ]; then
   APP_IMAGE="${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}"
 fi
 
+export APP_IMAGE
+export APP_PORT="${APP_PORT:-80}"
+
 echo "Resolved APP_IMAGE=${APP_IMAGE}"
+echo "Resolved APP_PORT=${APP_PORT}"
 
 if [ -n "${GHCR_TOKEN:-}" ] && [ -n "${GHCR_USERNAME:-}" ]; then
   echo "Logging into GitHub Container Registry..."
